@@ -1481,6 +1481,346 @@ PHOSHEOF
         }.start()
     }
 
+    /**
+     * Start an XFCE desktop session inside the chroot.
+     * XFCE is a traditional multi-window desktop environment suitable for DeX/desktop mode.
+     */
+    @Synchronized
+    fun startXfceSession(screenWidth: Int = 1080, screenHeight: Int = 2160) {
+        if (!hasRoot()) {
+            Log.e(TAG, "Cannot start session without root")
+            return
+        }
+        if (!isRootfsReady()) {
+            Log.e(TAG, "Rootfs not ready")
+            return
+        }
+        if (isRunning()) Log.w(TAG, "Replacing existing tracked session")
+        stopTrackedSessionProcess()
+        killRootfsProcesses()
+
+        ensureMounts()
+        bindX11Socket()
+        prepareCloseRangeCompatibility()
+        prepareDisplayResizeHelper()
+        prepareFlatpakCompatibility()
+
+        val hardwareGpu = prepareHardwareGpu()
+        val displayScale = when {
+            context.resources.displayMetrics.densityDpi >= 500 -> 3
+            context.resources.displayMetrics.densityDpi >= 280 -> 2
+            else -> 1
+        }
+        val gpuEnvironment = if (hardwareGpu) {
+            """
+                export NATIVOS_GPU=turnip
+                export WLR_RENDERER=pixman
+                unset LIBGL_ALWAYS_SOFTWARE
+                unset GBM_ALWAYS_SOFTWARE
+                export GALLIUM_DRIVER=zink
+                export MESA_LOADER_DRIVER_OVERRIDE=zink
+                export VK_ICD_FILENAMES=${turnipIcd.absolutePath.removePrefix(rootfsDir.absolutePath)}
+                export TU_DEBUG=noconform
+                export ZINK_DESCRIPTORS=lazy
+                export MESA_VK_WSI_DEBUG=sw
+            """.trimIndent()
+        } else {
+            """
+                export NATIVOS_GPU=software
+                export WLR_RENDERER=pixman
+                export LIBGL_ALWAYS_SOFTWARE=1
+                export GBM_ALWAYS_SOFTWARE=1
+                export GALLIUM_DRIVER=llvmpipe
+                export MESA_LOADER_DRIVER_OVERRIDE=swrast
+            """.trimIndent()
+        }
+
+        val preloadLibraries =
+            "/usr/local/lib/libsocket_hook.so /usr/local/lib/libnativos-close-range.so /usr/local/lib/libnodri3.so /usr/local/lib/libandroid-shmem.so"
+        val appPreloadLibraries = if (hardwareGpu) {
+            "/usr/local/lib/libsocket_hook.so /usr/local/lib/libnativos-close-range.so /usr/local/lib/libandroid-shmem.so"
+        } else {
+            preloadLibraries
+        }
+
+        val nativeLibDir = context.applicationInfo.nativeLibraryDir
+        val flatpakUid = context.applicationInfo.uid
+        val runScript = """
+            # Standard FHS PATH
+            export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            export TMPDIR=/tmp
+            export HOME=/root
+            export XDG_RUNTIME_DIR=/tmp/runtime-root
+            export XDG_SESSION_TYPE=x11
+            export XDG_CURRENT_DESKTOP=XFCE
+            export XDG_SESSION_DESKTOP=xfce
+            export DESKTOP_SESSION=xfce
+            export XDG_DATA_HOME=/root/.local/share
+            export XDG_DATA_DIRS=/root/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/run/nativOS/android-apps/share:/usr/local/share:/usr/share
+            export XDG_CONFIG_DIRS=/etc/xdg
+            export DISPLAY=:0
+            export LANG=C.UTF-8
+            export LC_ALL=C.UTF-8
+            export GTK_A11Y=none
+            export GSK_RENDERER=cairo
+            $gpuEnvironment
+
+            # The desktop runs as root to manage this private chroot, while
+            # Flatpak applications are dropped to the Android app UID.
+            if ! getent passwd \$flatpakUid >/dev/null 2>&1; then
+                useradd --uid \$flatpakUid --user-group --no-create-home --home-dir /root \
+                    --shell /usr/sbin/nologin nativos-app
+            fi
+            mkdir -p /etc/opt/chrome/policies/managed \
+                /etc/opt/chrome/policies/recommended \
+                /etc/opt/chrome/policies/enrollment
+            dbus-uuidgen --ensure=/etc/machine-id
+
+            configure_cobalt_wayland() {
+                app_id="\$1"
+                flags_name="\$2"
+                [ -d "/root/.local/share/flatpak/app/\$app_id" ] || return 0
+                flags_dir="/root/.var/app/\$app_id/config"
+                flags_file="\$flags_dir/\$flags_name-flags.conf"
+                mkdir -p "\$flags_dir"
+                touch "\$flags_file"
+                grep -qxF -- '--ozone-platform=wayland' "\$flags_file" || \
+                    printf '%s\n' '--ozone-platform=wayland' >> "\$flags_file"
+            }
+            (
+                while true; do
+                    configure_cobalt_wayland com.google.Chrome chrome
+                    configure_cobalt_wayland com.microsoft.Edge edge
+                    configure_cobalt_wayland com.brave.Browser brave
+                    configure_cobalt_wayland com.vivaldi.Vivaldi vivaldi
+                    configure_cobalt_wayland com.opera.Opera opera
+                    sleep 5
+                done
+            ) &
+
+            mkdir -p /etc/dbus-1
+            cat > /etc/dbus-1/session-local.conf << 'DBUSEOF'
+<busconfig>
+  <policy context="default">
+    <allow user="$flatpakUid"/>
+  </policy>
+</busconfig>
+DBUSEOF
+
+            # Ensure runtime dir exists with correct permissions
+            mkdir -p /tmp/runtime-root
+            chown root:root /tmp/runtime-root
+            chmod 0700 /tmp/runtime-root
+
+            # GNOME Software and PackageKit require a system bus.
+            mkdir -p /run/dbus
+            rm -f /run/dbus/pid /run/dbus/system_bus_socket
+            dbus-uuidgen --ensure
+            if dbus-daemon --system --fork --nopidfile; then
+                echo "NativOS: System D-Bus started"
+                if [ -x /usr/lib/polkit-1/polkitd ]; then
+                    /usr/lib/polkit-1/polkitd --no-debug &
+                    echo "NativOS: polkit started"
+                fi
+            else
+                echo "NativOS: WARNING — system D-Bus failed to start"
+            fi
+
+            # Run OpenSSH when it is present in the rootfs.
+            if [ -x /usr/sbin/sshd ]; then
+                mkdir -p /run/sshd /root/.ssh /etc/ssh/sshd_config.d
+                chmod 0700 /root/.ssh
+                cat > /etc/ssh/sshd_config.d/nativos.conf << 'SSHEOF'
+Port 8022
+ListenAddress 0.0.0.0
+PermitRootLogin prohibit-password
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+UsePAM no
+SSHEOF
+                ssh-keygen -A
+                pkill -x sshd 2>/dev/null || true
+                if /usr/sbin/sshd -t && /usr/sbin/sshd -E /tmp/sshd.log; then
+                    echo "NativOS: SSH ready on port 8022 (key only)"
+                else
+                    echo "NativOS: WARNING — SSH failed to start"
+                fi
+            fi
+
+            # Set root password to 1234 so lockscreen can be unlocked
+            echo 'root:1234' | chpasswd
+
+            # Start the NativOS bridge client daemon
+            if [ -f /usr/local/bin/nativOS-bridge ]; then
+                /usr/local/bin/nativOS-bridge &
+                echo "NativOS: Bridge client started"
+            fi
+
+            # Clean up any lingering X11 sockets
+            rm -rf /tmp/.X11-unix/* 2>/dev/null || true
+            rm -rf /tmp/runtime-root/* 2>/dev/null || true
+
+            # Generate xorg.conf for embedded X11
+            mkdir -p /etc/nativOS
+            cat > /etc/nativOS/xorg.conf << XORGEOF
+Section "Device"
+    Identifier "DummyVideo"
+    Driver "dummy"
+    VideoRam 256000
+EndSection
+
+Section "Monitor"
+    Identifier "DummyMonitor"
+    HorizSync 28.0-80.0
+    VertRefresh 48.0-75.0
+    Modeline "${screenWidth}x${screenHeight}" 60.00 ${screenWidth} ${screenWidth} ${screenWidth} ${screenWidth} ${screenHeight} ${screenHeight} ${screenHeight} ${screenHeight}
+EndSection
+
+Section "Screen"
+    Identifier "DefaultScreen"
+    Device "DummyVideo"
+    Monitor "DummyMonitor"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth 24
+        Modes "${screenWidth}x${screenHeight}"
+    EndSubSection
+EndSection
+
+Section "ServerLayout"
+    Identifier "DefaultLayout"
+    Screen "DefaultScreen"
+EndSection
+XORGEOF
+
+            echo "NativOS: Display configured: ${screenWidth}x${screenHeight} @ scale $displayScale"
+            echo "NativOS: Starting XFCE session..."
+
+            # Configure X11 environment for embedded server
+            export WLR_BACKENDS=x11
+            export WLR_X11_OUTPUTS=1
+            export DISPLAY=:0
+            export WLR_DRM_NO_ATOMIC=1
+            export WLR_DRM_DEVICES=""
+
+            # CRITICAL: Set TMPDIR to match the Android app's TMPDIR
+            export TMPDIR=${tmpDir.absolutePath}
+
+            # LD_PRELOAD: Only load libraries that actually exist
+            PRELOAD=""
+            for lib in \$preloadLibraries; do
+                if [ -f "\$lib" ]; then
+                    if [ -z "\$PRELOAD" ]; then
+                        PRELOAD="\$lib"
+                    else
+                        PRELOAD="\$PRELOAD:\$lib"
+                    fi
+                fi
+            done
+            if [ -n "\$PRELOAD" ]; then
+                export LD_PRELOAD=\$PRELOAD
+                echo "NativOS: LD_PRELOAD=\$LD_PRELOAD"
+            else
+                echo "NativOS: No LD_PRELOAD libraries found (fresh install)"
+            fi
+
+            # App preload (without libnodri3 for hardware acceleration)
+            APP_PRELOAD=""
+            for lib in \$appPreloadLibraries; do
+                if [ -f "\$lib" ]; then
+                    if [ -z "\$APP_PRELOAD" ]; then
+                        APP_PRELOAD="\$lib"
+                    else
+                        APP_PRELOAD="\$APP_PRELOAD:\$lib"
+                    fi
+                fi
+            done
+            export NATIVOS_APP_LD_PRELOAD="\$APP_PRELOAD"
+
+            echo "NativOS: TMPDIR=\$TMPDIR"
+            echo "NativOS: DISPLAY=\$DISPLAY"
+            echo "NativOS: GPU=\$NATIVOS_GPU"
+
+            # Start XFCE via startxfce4 (handles xfwm4, panel, session)
+            cat > /tmp/start_xfce.sh << 'XFCEEOF'
+#!/bin/bash
+echo $$ > /tmp/xfce_loop.pid
+while true; do
+    # Start X11 server first (Xlorie/embedded)
+    if [ -x /usr/bin/X ]; then
+        X :0 -config /etc/nativOS/xorg.conf -nolisten tcp -retro &
+        X_PID=\$!
+        sleep 2
+    fi
+    
+    # Start XFCE session
+    dbus-run-session -- startxfce4
+    
+    echo "NativOS: XFCE exited, restarting..."
+    [ -n "\$X_PID" ] && kill \$X_PID 2>/dev/null || true
+    sleep 0.5
+done
+XFCEEOF
+            chmod +x /tmp/start_xfce.sh
+            exec /tmp/start_xfce.sh
+        """.trimIndent()
+
+        Log.i(TAG, "Starting XFCE session")
+
+        val suXfce = rootShell.findSuPath() ?: return
+        val fullCommandXfce = "chroot ${rootfsDir.absolutePath} /usr/bin/env -i /bin/bash -c ${shellQuote(runScript)}"
+        val startedSessionXfce = ProcessBuilder(suXfce, "-c", fullCommandXfce)
+            .redirectErrorStream(true)
+            .start()
+        sessionProcess = startedSessionXfce
+
+        // Log output from the session
+        Thread {
+            try {
+                val reader = startedSessionXfce.inputStream.bufferedReader()
+                val buffer = CharArray(1024)
+                var charsRead: Int
+                while (reader.read(buffer).also { charsRead = it } != -1) {
+                    Log.d(TAG, "SESSION: " + String(buffer, 0, charsRead))
+                }
+            } catch (error: java.io.IOException) {
+                Log.d(TAG, "Session output stream closed")
+            }
+        }.start()
+    }
+
+    /** Check if XFCE is installed in the rootfs. */
+    fun isXfceInstalled(): Boolean =
+        File(rootfsDir, "usr/bin/startxfce4").exists() ||
+        File(rootfsDir, "usr/bin/xfwm4").exists()
+
+    /** Wait until XFCE session is ready (X11 server + xfwm4 + panel). */
+    fun awaitXfceReady(timeoutMs: Long = 30_000): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (sessionProcess?.isAlive != true) return false
+            if (execChroot(
+                    "test -S /tmp/.X11-unix/X0 && " +
+                        "(pgrep -x xfwm4 >/dev/null 2>&1 || pidof xfwm4 >/dev/null 2>&1) && " +
+                        "(pgrep -x xfce4-panel >/dev/null 2>&1 || pidof xfce4-panel >/dev/null 2>&1)"
+                ) == 0
+            ) {
+                Log.i(TAG, "XFCE desktop readiness check passed")
+                Thread.sleep(500)
+                return true
+            }
+            try {
+                Thread.sleep(250)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
+        Log.e(TAG, "XFCE desktop did not become ready within ${timeoutMs}ms")
+        return false
+    }
+
     /** Wait until both the Wayland socket and Phosh process exist. */
     fun awaitDesktopReady(timeoutMs: Long = 20_000): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs

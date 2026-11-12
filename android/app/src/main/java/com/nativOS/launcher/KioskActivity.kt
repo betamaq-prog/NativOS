@@ -51,7 +51,7 @@ import java.lang.ref.WeakReference
  *   1. Initialize X11 surface (LorieView)
  *   2. Download Linux rootfs (if first boot)
  *   3. Extract and configure rootfs
- *   4. Install Phosh desktop (if not installed)
+ *   4. Install XFCE desktop (if not installed)
  *   5. Start the Linux desktop session
  *
  * Escape hatch: press Volume Up 5 times rapidly to show Android.
@@ -323,15 +323,13 @@ class KioskActivity : Activity() {
             FrameLayout.LayoutParams.WRAP_CONTENT
         ))
 
-        // Phosh 0.38 has no persistent bottom affordance. Provide a small,
-        // functional phone-style handle: tap or swipe it upward to toggle the
-        // Phosh overview via its Super_L shortcut.
+        // XFCE panel provides window management. Overview handled by Alt+Tab.
         navigationHandle = FrameLayout(this).apply {
             contentDescription = "Open Linux overview"
             visibility = View.GONE
             isClickable = true
             isFocusable = true
-            setOnClickListener { togglePhoshOverview() }
+            setOnClickListener { toggleDesktopOverview() }
             addView(View(this@KioskActivity).apply {
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.RECTANGLE
@@ -481,7 +479,7 @@ class KioskActivity : Activity() {
      * Keep the Linux display inside Android's physical safe area. System bars
      * may be hidden, but their stable geometry still protects gesture handles,
      * navigation buttons and landscape side bars. The display cutout protects
-     * Phosh's centered clock from notches and hole-punch cameras.
+     * XFCE panel positioning for notches and hole-punch cameras.
      */
     private fun updateDesktopSafeInsets(insets: WindowInsets) {
         val cutout = insets.displayCutout
@@ -535,12 +533,15 @@ class KioskActivity : Activity() {
         view.requestLayout()
     }
 
-    private fun togglePhoshOverview() {
+    private fun toggleDesktopOverview() {
         val view = desktopView ?: return
-        view.sendKeyEvent(0, KeyEvent.KEYCODE_META_LEFT, true)
+        // XFCE: Alt+Tab for window switcher, Super for whiskermenu
+        view.sendKeyEvent(0, KeyEvent.KEYCODE_ALT_LEFT, true)
+        view.sendKeyEvent(0, KeyEvent.KEYCODE_TAB, true)
         view.postDelayed({
             if (view.isAttachedToWindow) {
-                view.sendKeyEvent(0, KeyEvent.KEYCODE_META_LEFT, false)
+                view.sendKeyEvent(0, KeyEvent.KEYCODE_TAB, false)
+                view.sendKeyEvent(0, KeyEvent.KEYCODE_ALT_LEFT, false)
             }
         }, 40)
     }
@@ -557,9 +558,13 @@ class KioskActivity : Activity() {
         Thread({
             val restored = chrootManager.restoreMaximizedX11Window(focusDesktop = true)
             if (restored) SystemClock.sleep(160)
-            val focused = chrootManager.focusPhoshWindow()
+            // XFCE: Send Super key to open whiskermenu (application launcher)
             runOnUiThread {
-                if (focused) desktopView?.postDelayed({ togglePhoshOverview() }, 80)
+                val view = desktopView ?: return@runOnUiThread
+                view.sendKeyEvent(0, KeyEvent.KEYCODE_META_LEFT, true)
+                view.postDelayed({
+                    if (view.isAttachedToWindow) view.sendKeyEvent(0, KeyEvent.KEYCODE_META_LEFT, false)
+                }, 40)
             }
         }, "LinuxHome").start()
     }
@@ -686,34 +691,34 @@ class KioskActivity : Activity() {
 
             // Step 4: Install essential packages (dbus is required for any session)
             updateOverlay(0.74, "Checking essential packages...", "")
-            if (!chrootManager.isPhoshInstalled()) {
-                updateOverlay(0.75, "Installing Phosh desktop...", "First boot — installing packages (5-15 min)")
+            if (!chrootManager.isXfceInstalled()) {
+                updateOverlay(0.75, "Installing XFCE desktop...", "First boot — installing packages (5-15 min)")
                 bootFailed = false
-                rootfsManager.installPhosh(chrootManager) { progress, status ->
+                rootfsManager.installXfce(chrootManager) { progress, status ->
                     if (progress < 0) {
                         bootFailed = true
-                        updateOverlay(-1.0, "Phosh installation failed", status)
+                        updateOverlay(-1.0, "XFCE installation failed", status)
                     } else {
                         updateOverlay(0.75 + progress * 0.20, status, "")
                     }
                 }
                 if (bootFailed) {
-                    // Even if Phosh failed, leave the rootfs package database usable.
-                    updateOverlay(0.90, "Installing minimal session...", "Phosh failed, trying fallback")
+                    // Even if XFCE failed, leave the rootfs package database usable.
+                    updateOverlay(0.90, "Installing minimal session...", "XFCE failed, trying fallback")
                     try {
                         chrootManager.execChroot(
                             "TMPDIR=/tmp DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends dbus dbus-x11")
                     } catch (_: Exception) {}
                 }
             } else {
-                updateOverlay(0.95, "Phosh desktop found", "")
+                updateOverlay(0.95, "XFCE desktop found", "")
             }
 
-            // A first-boot install can be interrupted after phoc is unpacked but
-            // before Phosh's required schemas arrive. Repair that partial state
+            // A first-boot install can be interrupted after packages are unpacked but
+            // before XFCE's required components arrive. Repair that partial state
             // instead of entering an invisible compositor restart loop.
-            updateOverlay(0.95, "Checking desktop components...", "Phosh runtime")
-            if (!rootfsManager.ensurePhoshRuntime(chrootManager)) {
+            updateOverlay(0.95, "Checking desktop components...", "XFCE runtime")
+            if (!rootfsManager.ensureXfceRuntime(chrootManager)) {
                 updateOverlay(
                     -1.0,
                     "Desktop repair failed",
@@ -722,8 +727,7 @@ class KioskActivity : Activity() {
                 return
             }
 
-            // Migrate existing installs away from the tiny unmanaged XTerm/UXTerm
-            // windows. GNOME Console is adaptive and is maximized by Phosh.
+            // Migrate existing installs to use xfce4-terminal.
             updateOverlay(0.95, "Checking terminal...", "GNOME Console")
             rootfsManager.ensureProfessionalTerminal(chrootManager)
 
@@ -838,21 +842,21 @@ class KioskActivity : Activity() {
 
             Log.i(TAG, "Starting test session...")
 
-            // Match Phoc's nested output to the actual X11 surface dimensions.
+            // Match XFCE X11 output to the actual embedded X11 surface dimensions.
             val screenWidth = lorieView.width
             val screenHeight = lorieView.height
             Log.i(TAG, "Detected screen: ${screenWidth}x${screenHeight}")
 
-            chrootManager.startPhoshSession(screenWidth, screenHeight)
-            updateOverlay(0.98, "Starting Linux desktop...", "Waiting for Phosh")
-            if (!chrootManager.awaitDesktopReady()) {
-                throw IllegalStateException("Phosh did not become ready")
+            chrootManager.startXfceSession(screenWidth, screenHeight)
+            updateOverlay(0.98, "Starting Linux desktop...", "Waiting for XFCE")
+            if (!chrootManager.awaitXfceReady()) {
+                throw IllegalStateException("XFCE did not become ready")
             }
             runOnUiThread {
                 overlayLayout?.visibility = View.GONE
                 keyboardButton?.visibility = View.VISIBLE
                 keyboardButton?.bringToFront()
-                // Current Phosh provides its own bottom gesture handle. Keep the
+                // XFCE panel provides its own window management. Keep the
                 // Android overlay handle hidden to avoid duplicate affordances.
                 navigationHandle?.visibility = View.GONE
             }
@@ -916,14 +920,12 @@ class KioskActivity : Activity() {
             }, delay)
         }
 
-        // Launching an Android shortcut closes Phosh's overview before Android
-        // takes focus. Returning would therefore show Phosh's valid but empty
-        // black home layer, which looks like a frozen renderer. Reopen the
-        // overview after the recreated Surface has received its first frames.
+        // Launching an Android shortcut may close XFCE's window overview.
+        // Reopen the overview after the recreated Surface has received its first frames.
         if (returningFromAndroid) {
             rootLayout?.postDelayed({
                 if (hasWindowFocus() && desktopView?.isAttachedToWindow == true) {
-                    togglePhoshOverview()
+                    toggleDesktopOverview()
                 }
             }, 400)
         }
@@ -939,7 +941,7 @@ class KioskActivity : Activity() {
         enterImmersiveMode()
 
         // The activity is retained across rotation so the X11 connection and
-        // Phosh session stay alive. Recalculate Android's cutout/navigation
+        // XFCE session stay alive. Recalculate Android's cutout/navigation
         // safe area, then notify X11 after SurfaceView has its new dimensions.
         assistiveMenu?.visibility = View.GONE
         rootLayout?.requestApplyInsets()
@@ -952,9 +954,7 @@ class KioskActivity : Activity() {
                     view.postDelayed({
                         val width = view.width
                         val height = view.height
-                        Thread({
-                            chrootManager.resizePhoshDisplay(width, height)
-                        }, "nativOS-display-resize").start()
+                        // XFCE handles resize via XRandR/X11 config; Phoc resize helper not applicable
                     }, 150)
                 }
             }

@@ -147,6 +147,37 @@ class RootfsManager(private val context: Context) {
         return false
     }
 
+    /** Verify XFCE runtime components are present (xfwm4, panel, session). */
+    fun ensureXfceRuntime(chrootManager: ChrootManager): Boolean {
+        val xfwm4 = File(rootfsDir, "usr/bin/xfwm4")
+        val panel = File(rootfsDir, "usr/bin/xfce4-panel")
+        val session = File(rootfsDir, "usr/bin/startxfce4")
+        val themeCache = File(rootfsDir, "usr/share/icons/hicolor/icon-theme.cache")
+        if (xfwm4.exists() && panel.exists() && session.exists() && themeCache.exists()) return true
+
+        Log.w(TAG, "XFCE runtime components missing; repairing interrupted provisioning")
+        val result = chrootManager.execChroot(
+            """
+                dpkg --configure -a || true
+                apt-get update || exit 1
+                TMPDIR=/tmp DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC \
+                    apt-get install -y --no-install-recommends \
+                    xfce4 xfce4-panel xfwm4 xfce4-session || exit 1
+                gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
+                gtk-update-icon-cache -f -t /usr/share/icons/Adwaita 2>/dev/null || true
+                test -f /usr/bin/xfwm4
+                test -f /usr/bin/xfce4-panel
+                test -f /usr/bin/startxfce4
+            """.trimIndent()
+        )
+        if (result == 0 && xfwm4.exists() && panel.exists() && session.exists()) {
+            Log.i(TAG, "XFCE runtime components repaired")
+            return true
+        }
+        Log.e(TAG, "Could not repair XFCE runtime components (exit $result)")
+        return false
+    }
+
     /** Install the adaptive Wayland terminal and remove the two legacy XTerm launchers. */
     fun ensureProfessionalTerminal(chrootManager: ChrootManager): Boolean {
         val console = File(rootfsDir, "usr/bin/kgx")
@@ -445,6 +476,133 @@ gcc -shared -fPIC -o /usr/local/lib/libnativos-close-range.so /tmp/close_range_c
         } catch (e: Exception) {
             Log.e(TAG, "Phosh install failed: ${e.message}", e)
             onProgress(-1.0, "Phosh install failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Install XFCE desktop environment in the chroot.
+     * XFCE is a traditional multi-window desktop suitable for DeX/desktop mode.
+     */
+    fun installXfce(chrootManager: ChrootManager, onProgress: (Double, String) -> Unit) {
+        try {
+            onProgress(0.0, "Clearing package locks...")
+            try { chrootManager.execChroot("rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock*; dpkg --configure -a 2>/dev/null || true") } catch (_: Exception) {}
+
+            onProgress(0.05, "Updating package lists...")
+            chrootManager.execChroot("apt-get update -y")
+
+            // dbus is CRITICAL - without it no session can start
+            onProgress(0.10, "Installing D-Bus (required)...")
+            chrootManager.execChroot("TMPDIR=/tmp DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends dbus dbus-x11 policykit-1 packagekit")
+
+            onProgress(0.15, "Installing XFCE Desktop...")
+            chrootManager.execChroot("TMPDIR=/tmp DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends xfce4 xfce4-goodies xfce4-terminal xfce4-session xfce4-panel xfce4-settings xfce4-power-manager xfce4-whiskermenu-plugin xfce4-pulseaudio-plugin xfce4-notifyd thunar thunar-volman thunar-archive-plugin tumbler gvfs gvfs-backends gvfs-fuse mousepad ristretto xfburn catfish mugshot lightdm-gtk-greeter lightdm xfwm4")
+
+            onProgress(0.30, "Installing Window Manager & Compositor...")
+            chrootManager.execChroot("TMPDIR=/tmp DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends picom compton 2>/dev/null || true")
+
+            onProgress(0.35, "Installing On-Screen Keyboard...")
+            chrootManager.execChroot("TMPDIR=/tmp DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends onboard maliit-keyboard 2>/dev/null || true")
+
+            onProgress(0.40, "Installing Core Applications...")
+            chrootManager.execChroot("TMPDIR=/tmp DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends firefox-esr xfce4-terminal mousepad gnome-calculator gnome-clocks nautilus file-roller evince eog vlc 2>/dev/null || true")
+
+            onProgress(0.50, "Installing Audio Stack...")
+            chrootManager.execChroot("TMPDIR=/tmp DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends pipewire pipewire-pulse wireplumber pavucontrol 2>/dev/null || apt-get install -y --no-install-recommends pulseaudio pavucontrol 2>/dev/null || true")
+
+            onProgress(0.55, "Installing Network Manager...")
+            chrootManager.execChroot("TMPDIR=/tmp DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends network-manager network-manager-gnome 2>/dev/null || true")
+
+            onProgress(0.60, "Installing Compilation Tools...")
+            chrootManager.execChroot("TMPDIR=/tmp DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends gcc libxcb1-dev libxcb-dri3-dev libc6-dev libvulkan1 vulkan-tools wget curl xserver-xorg-video-dummy xserver-xorg-input-libinput")
+
+            onProgress(0.70, "Building universal hooks (Socket)...")
+            chrootManager.execChroot("""
+                bash -c "cat > /tmp/socket_hook.c << 'EOF'
+#define _GNU_SOURCE
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <dlfcn.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stddef.h>
+int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    int (*real_connect)(int, const struct sockaddr *, socklen_t) = dlsym(RTLD_NEXT, \"connect\");
+    if (addr && addr->sa_family == AF_UNIX) {
+        struct sockaddr_un *un = (struct sockaddr_un *)addr;
+        if (strstr(un->sun_path, \".X11-unix/X\")) {
+            struct sockaddr_un abstract_addr;
+            memset(&abstract_addr, 0, sizeof(abstract_addr));
+            abstract_addr.sun_family = AF_UNIX;
+            const char *tmpdir = getenv(\"TMPDIR\");
+            if (!tmpdir) tmpdir = \"/tmp\";
+            snprintf(abstract_addr.sun_path + 1, sizeof(abstract_addr.sun_path) - 1, \"%s/.X11-unix/X0\", tmpdir);
+            socklen_t abs_len = offsetof(struct sockaddr_un, sun_path) + 1 + strlen(abstract_addr.sun_path + 1);
+            return real_connect(sockfd, (struct sockaddr *)&abstract_addr, abs_len);
+        }
+    }
+    return real_connect(sockfd, addr, addrlen);
+}
+EOF
+gcc -shared -fPIC -o /usr/local/lib/libsocket_hook.so /tmp/socket_hook.c -ldl"
+            """.trimIndent())
+
+            onProgress(0.80, "Building universal hooks (DRI3)...")
+            chrootManager.execChroot("""
+                bash -c "cat > /tmp/nodri3.c << 'EOF'
+#include <xcb/xcb.h>
+#include <dlfcn.h>
+#include <stdio.h>
+extern xcb_extension_t xcb_dri3_id;
+const xcb_query_extension_reply_t *xcb_get_extension_data(xcb_connection_t *c, xcb_extension_t *ext) {
+    const xcb_query_extension_reply_t *(*real_fn)(xcb_connection_t*, xcb_extension_t*) = dlsym(RTLD_NEXT, \"xcb_get_extension_data\");
+    if (ext == &xcb_dri3_id) {
+        const xcb_query_extension_reply_t *reply = real_fn(c, ext);
+        if (reply && reply->present) {
+            ((xcb_query_extension_reply_t *)reply)->present = 0;
+        }
+        return reply;
+    }
+    return real_fn(c, ext);
+}
+EOF
+gcc -shared -fPIC -o /usr/local/lib/libnodri3.so /tmp/nodri3.c -lxcb -ldl -lxcb-dri3"
+            """.trimIndent())
+
+            chrootManager.execChroot("""
+                bash -c "cat > /tmp/close_range_compat.c << 'EOF'
+#define _GNU_SOURCE
+#include <errno.h>
+int close_range(unsigned int first, unsigned int last, int flags) {
+    (void) first; (void) last; (void) flags;
+    errno = ENOSYS;
+    return -1;
+}
+EOF
+gcc -shared -fPIC -o /usr/local/lib/libnativos-close-range.so /tmp/close_range_compat.c"
+            """.trimIndent())
+
+            onProgress(0.90, "Installing Built-in Apps & Store...")
+            chrootManager.execChroot("TMPDIR=/tmp DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends software-properties-common nautilus gnome-calculator gnome-clocks gnome-software gnome-software-plugin-flatpak flatpak")
+
+            onProgress(0.95, "Setting up Firefox...")
+            chrootManager.execChroot("""
+                bash -c "add-apt-repository -y ppa:mozillateam/ppa && echo 'Package: *\nPin: release o=LP-PPA-mozillateam\nPin-Priority: 1001\n\nPackage: firefox\nPin: version 1:1snap1-0ubuntu2\nPin-Priority: -1' > /etc/apt/preferences.d/mozilla-firefox && apt-get update && DEBIAN_FRONTEND=noninteractive TZ=Etc/UTC apt-get install -y --no-install-recommends firefox"
+            """.trimIndent())
+
+            onProgress(0.97, "Configuring Flathub...")
+            ensureFlathub(chrootManager)
+
+            onProgress(0.98, "Building icon caches...")
+            chrootManager.execChroot("""
+                bash -c "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && GDK_LOADER=\$(find /usr/lib -name gdk-pixbuf-query-loaders | head -n 1) && \$GDK_LOADER > \$(dirname \$GDK_LOADER)/2.10.0/loaders.cache && gtk-update-icon-cache -f -t /usr/share/icons/hicolor && gtk-update-icon-cache -f -t /usr/share/icons/Adwaita && glib-compile-schemas /usr/share/glib-2.0/schemas"
+            """.trimIndent())
+
+            onProgress(1.0, "XFCE installed!")
+        } catch (e: Exception) {
+            Log.e(TAG, "XFCE install failed: ${e.message}", e)
+            onProgress(-1.0, "XFCE install failed: ${e.message}")
         }
     }
 
